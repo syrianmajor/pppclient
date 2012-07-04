@@ -53,7 +53,7 @@ function watchfirewall {
     tail -n 0 -f "$iptlogfile" | while read -r line; do
 	if [ -n "$(echo $line | grep $iptpfx)" ]; then
 	    packetcount=$(($packetcount + 1))
-	    local msg=$(echo $line | sed s/.*"$iptpfx"'.* SRC=\([^ ]*\) DST=\([^ ]*\) .*PROTO=\([^ ]*\) .*UID=\([0-9]*\).*'/"Blocked packet ($packetcount): "'\1 > \2 (\3) from user ID \4'/);
+	    local msg=$(echo $line | sed s/.*"$iptpfx"'.* SRC=\([^ ]*\) DST=\([^ ]*\) .*PROTO=\([^ ]*\) ?.*'/"Blocked packet ($packetcount): "'\1 > \2 (protocol: \3)'/);
 	    print_warning "$msg"
 	fi
 
