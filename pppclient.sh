@@ -9,6 +9,10 @@
 
 # CHANGED: 2012-06-09: Corrected some bugs that caused some error messages to be displayed during periodic checks of /etc/resolv.conf and iptables counters
 
+# CHANGED: 2012-07-04:
+# - ask for full redirection before actually connecting;
+# - use iptables LOG target to report details of blocked packets.
+
 function datestamp {
     echo -n $(date +"%Y-%m-%d %H:%M:%S")
 }
@@ -31,7 +35,8 @@ function print_warning {
 }
 
 function print_right {
-    echo -en "\E[$(($(tput cols) - 10))G\E[1m$1\E[0m"
+    local len=$(echo $1 | wc -m)
+    echo -en "\E[$(($(tput cols) - 1 - $len))G\E[1m$1\E[0m"
     return 0
 }
 
@@ -41,78 +46,49 @@ function print_center {
     echo -e "\E[${leftcol}G$1\E[0m"
 }
 
-function watchdns {
-    local sha1=$1
-    local terminate=no
-    local packetcount4=0
-    local packetcount6=0
-    
-    while [ $terminate = no ]; do
-	local count4tcp=$($ipt -vnL OUTPUT | egrep '^ +[0-9]+ +[0-9]+[KMGT]* +DROP +tcp +-- +\* +'"$dev"' +0\.0\.0\.0/0 +0\.0\.0\.0/0 +tcp +dpt:53' | awk {'print $1'})
-	local count4udp=$($ipt -vnL OUTPUT | egrep '^ +[0-9]+ +[0-9]+[KMGT]* +DROP +udp +-- +\* +'"$dev"' +0\.0\.0\.0/0 +0\.0\.0\.0/0 +udp +dpt:53' | awk {'print $1'})
-	local count6tcp=$($ip6t -vnL OUTPUT | egrep '^ +[0-9]+ +[0-9]+[KMGT]* +DROP +tcp +\* +'"$dev"' +::/0 +::/0 +tcp +dpt:53' | awk {'print $1'})
-	local count6udp=$($ip6t -vnL OUTPUT | egrep '^ +[0-9]+ +[0-9]+[KMGT]* +DROP +udp +\* +'"$dev"' +::/0 +::/0 +udp +dpt:53' | awk {'print $1'})
-	local prevct4=$packetcount4
-	local prevct6=$packetcount6
+# This function watches logs for iptables traces reporting blocked packets.
+function watchfirewall {
+    local packetcount=0
 
+    tail -n 0 -f "$iptlogfile" | while read -r line; do
+	if [ -n "$(echo $line | grep $iptpfx)" ]; then
+	    packetcount=$(($packetcount + 1))
+	    local msg=$(echo $line | sed s/.*"$iptpfx"'.* SRC=\([^ ]*\) DST=\([^ ]*\) .*PROTO=\([^ ]*\) .*UID=\([0-9]*\).*'/"Blocked packet ($packetcount): "'\1 > \2 (\3) from user ID \4'/);
+	    print_warning "$msg"
+	fi
+
+	if [ ! -r $pidfile ]; then
+	    exit
+	fi
+    done
+}
+
+# This function watches every second the status of /etc/resolv.conf and routing
+# It sets them back to the right value if they were changed (in general this is
+# due to NetworkManager)
+function watchconfig {
+    local terminate=no
+    local sha1_resolvconf="$1"
+    local watchgw="$2"
+    local watchif="$3"
+ 
+    while [ $terminate = no ]; do
 	if [ ! -r $pidfile ]; then
 	    terminate=yes
 	else
-	    packetcount4=$(($count4tcp + $count4udp))
-	    packetcount6=$(($count6tcp + $count6udp))
-
-	    if [ $prevct4 != $packetcount4 ]; then
-		print_warning "$packetcount4 DNS packets were blocked while trying to escape the VPN (IPv4)"
-	    fi
-	    if [ $prevct6 != $packetcount6 ]; then
-		print_warning "$packetcount6 DNS packets were blocked while trying to escape the VPN (IPv6)"
-	    fi
-
-	    if [ $(sha1sum /etc/resolv.conf | awk {'print $1'}) != $sha1 ]; then
+	    if [ $(sha1sum /etc/resolv.conf | awk {'print $1'}) != $sha1_resolvconf ]; then
 		print_warning "/etc/resolv.conf changed, putting ours back in place."
 		echo "$resolvconf" >/etc/resolv.conf
 	    fi
-	fi
-	sleep 1
-    done
+	    if [ $full = y -a -n "$watchgw" -a -n "$watchif" ]; then
+		local curgw=$($ip_exec route | awk '/default/ { print $3 }')
+		local curif=$($ip_exec route | awk '/default/ { print $5 }')
 
-    if [ -r $pidfile ]; then
-	kill $pid 2>/dev/null
-    fi
-}
-
-function watchdefroute {
-    local watchgw=$1
-    local watchif=$2 
-    local terminate=no
-    local packetcount4=0
-    local packetcount6=0
-
-    while [ $terminate = no ]; do
-	local count4=$($ipt -vnL OUTPUT | egrep '^ +[0-9]+ +[0-9]+[KMGT]* +DROP +all +-- +\* +'"$dev"' +0\.0\.0\.0/0 +!'"$host" | awk {'print $1'})
-	local count6=$($ip6t -vnL OUTPUT | egrep '^ +[0-9]+ +[0-9]+[KMGT]* +DROP +all +\* +'"$dev"' +::/0 +::/0' | awk {'print $1'})
-	local prevct4=$packetcount4
-	local prevct6=$packetcount6
-	local curgw=$($ip_exec route | awk '/default/ { print $3 }')
-	local curif=$($ip_exec route | awk '/default/ { print $5 }')
-
-	packetcount4=$count4
-	packetcount6=$count6
-
-	if [ ! -r $pidfile ]; then
-	    terminate=yes
-	else
-	
-	    if [ $prevct4 != $packetcount4 ]; then
-		print_warning "Blocked $packetcount4 IPv4 packets that tried to escape the VPN so far"
-	    fi
-	    if [ $prevct6 != $packetcount6 ]; then
-		print_warning "Blocked $packetcount6 IPv6 packets that tried to escape the VPN so far"
-	    fi
-	    if [ "$curgw" != "$watchgw" ]; then
-		print_warning "Routing was changed externally (should be $watchgw, is $curgw). Setting it back to the good values."
-		$ip_exec route del default || terminate=yes
-		$ip_exec route add default via $watchgw dev $watchif || terminate=yes
+		if [ "$curgw" != "$watchgw" ]; then
+		    print_warning "Gateway was changed externally to $curgw. Setting it (back) to $watchgw."
+		    $ip_exec route del default || terminate=yes
+		    $ip_exec route add default via $watchgw dev $watchif || terminate=yes
+		fi
 	    fi
 	fi
 
@@ -133,6 +109,7 @@ pwd=$(pwd)
 if [ -z "$(echo $host | egrep '^([0-9]{1,3}\.){3}[0-9]{1,3}')" ]; then host=$(dig +short | head -n 1); fi
 if [ -z "$host" ]; then print_error "Unable to resolve hostname"; exit; fi
 
+# Look for various required commands...
 which pppd >/dev/null 2>&1 || (print_error "Could not find pppd" && kill $$)
 which sha1sum >/dev/null 2>&1 || (print_error "Could not find sha1sum" && kill $$)
 which uuidgen >/dev/null 2>&1 || (print_error "Could not find uuidgen" && kill $$)
@@ -158,7 +135,9 @@ gateway=$($ip_exec route | awk '/default/ { print $3 }')
 [ -z "$gateway" ] && print_error "Could not get current gateway. Are you connected to the Internet?" && exit
 dev=$($ip_exec route | awk '/default/ { print $5 }')
 
+# Pre-set config
 id=$(uuidgen)
+iptpfx="PPPTCX-"$(echo $id | cut -d - -f 1)
 resolvconf="nameserver 10.8.49.1
 nameserver 8.8.8.8
 nameserver 8.8.4.4"
@@ -170,10 +149,20 @@ CAfile = $pwd/wnh-ca.crt
 connect = $host:$port
 TIMEOUTconnect = 60
 output = /tmp/stunnel.log-$id"
+
+# iptables rules (DNS only for non full redirection)
 dnsfw_udp="-o $dev -p udp --dport 53 -j DROP"
 dnsfw_tcp="-o $dev -p tcp --dport 53 -j DROP"
+dnslog_udp="-o $dev -p udp --dport 53 -j LOG --log-level 4 --log-prefix $iptpfx --log-ip-options --log-uid"
+dnslog_tcp="-o $dev -p tcp --dport 53 -j LOG --log-level 4 --log-prefix $iptpfx --log-ip-options --log-uid"
+
+# iptables rules (for full redirection)
+routelog4="-o $dev ! -d $host -j LOG --log-level 4 --log-prefix $iptpfx --log-ip-options --log-uid"
+routelog6="-o $dev -j LOG --log-level 4 --log-prefix $iptpfx --log-ip-options --log-uid"
 routefw4="-o $dev ! -d $host -j DROP"
 routefw6="-o $dev -j DROP"
+
+iptlogfile=""
 
 shift
 shift
@@ -187,12 +176,23 @@ echo Port: $port
 echo Current gateway: $gateway "($dev)"
 echo -----------
 
+# 0. Find where iptables messages will be logged to
+echo -n "Looking for iptables logging... "
+$ipt -I OUTPUT 1 -o lo -j LOG --log-level 4 --log-prefix "testTCX-$shortid" --log-ip-options --log-uid
+ping -c 1 127.0.0.1 >/dev/null 2>&1
+iptlogfile=$(grep -HZr "testTCX-$shortid" /var/log/ | awk -F '\0' {'print $1'} | head -n 1)
+$ipt -D OUTPUT -o lo -j LOG --log-level 4 --log-prefix "testTCX-$shortid" --log-ip-options --log-uid
+if [ -n "$iptlogfile" ]; then echo $(print_right "$iptlogfile"); else echo $(print_right "Not found!"); fi
 
 # 1. Generate stunnel config
 echo "$stunnelconf" >/tmp/stunnel.conf-$id
 
 # 2. Retrieve interface list before pppd startup
 oldiflist="("$($ip_exec addr | awk -F ': ' '/^[0-9]/ { print $2 }' | xargs | sed 's/ /|/g')")"
+
+full=n
+echo -n "Do you want to activate full redirection of your traffic (i.e. change default route)? [y/n] "
+read full
 
 # 3. Start pppd
 echo -n "Starting pppd... "
@@ -259,17 +259,6 @@ echo "Changing DNS servers in /etc/resolv.conf"
 mv -f /etc/resolv.conf /tmp/resolv.conf-$id
 echo "$resolvconf" >/etc/resolv.conf
 
-echo "Blocking port 53 (DNS) to interface $dev with iptables"
-$ipt -A OUTPUT $dnsfw_tcp
-$ipt -A OUTPUT $dnsfw_udp
-$ip6t -A OUTPUT $dnsfw_tcp
-$ip6t -A OUTPUT $dnsfw_udp
-
-watchdns $(sha1sum /etc/resolv.conf | awk {'print $1'}) &
-
-echo -n "Do you want to activate full redirection of your traffic (i.e. change default route)? [y/n] "
-read full
-
 if [ "$full" = "y" ]; then
     $ip_exec route add $host/32 via $gateway
     $ip_exec route del default
@@ -277,13 +266,28 @@ if [ "$full" = "y" ]; then
     echo "Blocking any traffic of $dev not destinated to the VPN endpoint ($host)"
     $ipt -I OUTPUT 1 $routefw4
     $ip6t -I OUTPUT 1 $routefw6
-    watchdefroute $gw $newif &
+    $ipt -I OUTPUT 1 $routelog4
+    $ip6t -I OUTPUT 1 $routelog6
+else
+    echo "Blocking and logging outbound traffic on port 53 (DNS) to interface $dev"
+    $ipt -A OUTPUT $dnslog_tcp
+    $ipt -A OUTPUT $dnslog_udp
+    $ipt -A OUTPUT $dnsfw_tcp
+    $ipt -A OUTPUT $dnsfw_udp
+    $ip6t -A OUTPUT $dnslog_tcp
+    $ip6t -A OUTPUT $dnslog_udp
+    $ip6t -A OUTPUT $dnsfw_tcp
+    $ip6t -A OUTPUT $dnsfw_udp
 fi
 
+watchconfig $(echo "$resolvconf" | sha1sum | awk {'print $1'}) $gw $newif &
+if [ -n "$iptlogfile" ]; then
+    watchfirewall &
+fi
 
-echo Routes added - Hit CTRL+C to stop.
+echo VPN is running - Hit CTRL+C to terminate it.
 
-trap "kill $pid" SIGINT
+trap "echo Received SIGINT, shutting down && kill $pid" SIGINT
 
 while [ -r $pidfile ]; do
     sleep 1
@@ -291,21 +295,30 @@ done
 
 echo Terminated - restoring configuration.
 print_log
-$ipt -D OUTPUT $dnsfw_tcp
-$ipt -D OUTPUT $dnsfw_udp
-$ip6t -D OUTPUT $dnsfw_tcp
-$ip6t -D OUTPUT $dnsfw_udp
+
 if [ "$full" = y ]; then
     $ipt -D OUTPUT $routefw4
     $ip6t -D OUTPUT $routefw6
+    $ipt -D OUTPUT $routelog4
+    $ip6t -D OUTPUT $routelog6
+else
+    $ipt -D OUTPUT $dnsfw_tcp
+    $ipt -D OUTPUT $dnsfw_udp
+    $ipt -D OUTPUT $dnslog_tcp
+    $ipt -D OUTPUT $dnslog_udp
+    $ip6t -D OUTPUT $dnsfw_tcp
+    $ip6t -D OUTPUT $dnsfw_udp
+    $ip6t -D OUTPUT $dnslog_tcp
+    $ip6t -D OUTPUT $dnslog_udp
 fi
+
 mv -f /tmp/resolv.conf-$id /etc/resolv.conf
 rm -f /tmp/*-$id
+
 if [ "$full" = "y" ]; then
     $ip_exec route add default via $gateway
     $ip_exec route del $host/32 via $gateway
 fi
-
 
 print_center "$(datestamp)"
 print_center "VPN session terminating"
